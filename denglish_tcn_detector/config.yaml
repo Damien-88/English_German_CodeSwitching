@@ -1,0 +1,41 @@
+# Model and training configuration for the 1D-TCN English-German
+# code-switching detector. Values mirror the initial architecture and
+# training setup described in the project paper (Sections 4.1-4.2) and the
+# README. Command-line flags passed to src/train.py and src/evaluate.py
+# override the corresponding values below.
+
+seed: 42
+
+data:
+  # Maximum number of characters kept per token; longer tokens are
+  # truncated and shorter ones are padded with the <PAD> character.
+  max_word_len: 20
+
+model:
+  # Character-level CNN feature extractor (src/models/char_cnn.py).
+  char_embed_dim: 32
+  char_filter_sizes: [2, 3, 4]
+  char_num_filters: 64
+
+  # 1D causal dilated TCN backbone (src/models/tcn_tagger.py).
+  tcn_channels: 128
+  tcn_num_blocks: 4
+  tcn_kernel_size: 3
+  # Dilation rates are derived as 2^i for i in range(tcn_num_blocks), i.e.
+  # [1, 2, 4, 8] for the default 4 blocks, giving a theoretical receptive
+  # field of 61 tokens (see TemporalConvNet.receptive_field).
+
+  dropout: 0.2
+
+training:
+  epochs: 10
+  batch_size: 64
+  learning_rate: 0.001
+  optimizer: adam
+  # Enabled automatically only when training on a CUDA device.
+  mixed_precision: true
+  checkpoint_dir: ../checkpoints
+  checkpoint_name: best_tcn.pt
+
+evaluation:
+  batch_size: 64

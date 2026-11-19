@@ -26,6 +26,7 @@ English_German_CodeSwitching/
 │   │   └── processed/            # Tokenized & mapped JSON/Parquet files
 │   ├── src/
 │   │   ├── __init__.py
+│   │   ├── corpus_converter.py   # Converts the raw Denglisch CSV release into sentence-level JSON
 │   │   ├── dataset.py            # PyTorch Dataset & character/token collators
 │   │   ├── preprocess.py         # Cleans, validates, and splits the raw corpus
 │   │   ├── models/
@@ -35,6 +36,7 @@ English_German_CodeSwitching/
 │   │   ├── train.py              # Training loop with mixed precision & logging
 │   │   └── evaluate.py           # Classification metrics and benchmarking
 │   ├── config.yaml               # Model and training configurations
+│   ├── conftest.py               # Adds src/ to sys.path for pytest
 │   ├── notebooks/                # Exploratory data analysis & error analysis
 │   └── tests/                    # Unit tests for shape checking & padding
 ├── requirements.txt
@@ -143,6 +145,34 @@ The resulting theoretical receptive field is 61 tokens, allowing the model to in
 
 All commands below are run from `denglish_tcn_detector/` (see Installation step 4).
 
+### Data Acquisition
+
+The raw Denglisch Corpus files are **not** committed to this repository (they belong to Osmelak & Wintner, 2023). Download the manually annotated, "collapsed"-scheme release from the authors' GitHub repository and place it under `data/raw/`:
+
+```bash
+curl -L -o data/raw/Manu_corpus_collapsed.csv.zip https://raw.githubusercontent.com/HaifaCLG/Denglisch/main/corpus/Manu_corpus_collapsed.csv.zip
+unzip data/raw/Manu_corpus_collapsed.csv.zip -d data/raw/
+```
+
+The larger, automatically annotated `corpus_collapsed.csv.zip` (~5M tokens) can be used the same way to grow the training split; see Section 5.3 of the project paper for the rationale behind prioritizing the manually annotated subset for validation/testing.
+
+### Corpus Conversion
+
+`src/corpus_converter.py` converts the official per-token CSV release (columns `source, user_name, sen_id, sen_num, token, categ`) into the sentence-level JSON format `preprocess.py` expects. It groups tokens into sentences by `(source, sen_id, sen_num)`, tags every sentence with a `comment_id` (`source:sen_id`) so comments never leak across splits, maps the corpus's collapsed annotation scheme onto the project's three target labels, and excludes tokens with no reliable single-language assignment:
+
+| Original category | Meaning | Target label |
+|---|---|---|
+| `D`, `SD` | German / Shared-German | `DE` |
+| `E`, `SE` | English / Shared-English | `EN` |
+| `O` | Punctuation, numbers, symbols | `NEUT` |
+| `M`, `SO` | Mixed morphology / Shared-Other (ambiguous) | *excluded* |
+
+```bash
+python src/corpus_converter.py --input data/raw/Manu_corpus_collapsed.csv --output data/raw/denglisch.json
+```
+
+The script logs the number of sentences/tokens retained and a full breakdown of excluded tokens by original category, as required by the paper's data-preparation methodology.
+
 ### Preprocessing
 
 To clean the raw Denglisch corpus, map the original annotations to the project's three target labels, split the dataset into training, validation, and test subsets, and build the character vocabulary:
@@ -157,11 +187,9 @@ The dataset will be divided into:
 - Validation: 10%
 - Testing: 10%
 
-A fixed random seed will be used to support reproducibility.
+When the input records carry a `comment_id` (as produced by `corpus_converter.py`), the split is performed at the comment level so that all sentences from the same Reddit comment stay in the same split, preventing data leakage. A fixed random seed is used throughout to support reproducibility.
 
 ### Training
-
-> **Note:** `train.py` currently defines the planned CLI interface below; the training loop itself is still under active development.
 
 To train the 1D-TCN model on preprocessed Denglisch corpus data:
 
@@ -169,11 +197,9 @@ To train the 1D-TCN model on preprocessed Denglisch corpus data:
 python src/train.py --data_dir data/processed --epochs 10 --batch_size 64 --lr 1e-3
 ```
 
-The initial training configuration will use 10 epochs, a batch size of 64, a learning rate of 0.001, and the Adam optimizer. Mixed-precision training will be enabled when supported by the available hardware.
+The initial training configuration uses 10 epochs, a batch size of 64, a learning rate of 0.001, and the Adam optimizer, all overridable via `config.yaml` or the corresponding CLI flags. Mixed-precision training is enabled automatically on CUDA devices. The checkpoint with the best validation macro-F1 is saved to `../checkpoints/best_tcn.pt` along with the character vocabulary, label map, and architecture hyperparameters needed to reload it. Pass `--no_char_cnn` to run the character-CNN ablation described in RQ2.
 
 ### Evaluation & Benchmarking
-
-> **Note:** `evaluate.py` currently defines the planned CLI interface below; the evaluation logic itself is still under active development.
 
 To evaluate token classification performance and measure inference throughput (tokens/sec):
 
@@ -181,7 +207,8 @@ To evaluate token classification performance and measure inference throughput (t
 python src/evaluate.py --checkpoint ../checkpoints/best_tcn.pt --test_data data/processed/test.json
 ```
 
-The evaluation will report:
+
+The evaluation reports:
 
 - Overall accuracy
 - Per-class precision, recall, and F1-score
@@ -189,15 +216,119 @@ The evaluation will report:
 - Weighted-F1
 - Confusion matrix
 - Inference throughput (tokens/sec)
-- Memory consumption
+- Memory consumption (peak GPU memory, or resident set size on CPU)
+
+A full JSON report is also written next to the checkpoint (e.g. `../checkpoints/best_tcn_eval_report.json`) for later comparison across runs/baselines.
+
+### Testing
+
+Unit tests cover tensor shapes, padding/masking behavior, causal-convolution correctness, label mapping, and comment-level data-leakage prevention:
+
+```bash
+python -m pytest tests
+```
+
+---
+
+## Analysis
+
+This section reports what was actually observed when the pipeline was run end-to-end on the
+manually annotated Denglisch Corpus subset (`Manu_corpus_collapsed.csv`), combining the
+exploratory notebooks (`notebooks/data_inspection.ipynb`, `notebooks/data_analysis.ipynb`) with a
+real training/evaluation run. It is purely descriptive; interpretation of what these numbers mean
+for the research questions is left to the Findings/Conclusion/Future Work sections (to follow).
+
+### Raw Corpus Composition
+
+The manually annotated subset contains 75,013 token rows across 34 subreddit sources, grouped into
+962 unique Reddit comments and ~4,202 sentences — closely matching the ~950 comments/~4,200
+sentences reported by Osmelak & Wintner (2023). Under the corpus's collapsed annotation scheme,
+token counts are:
+
+| Category | Meaning | Count |
+|---|---|---|
+| `E` | English | 29,918 |
+| `D` | German | 29,730 |
+| `O` | Other (punctuation/numbers) | 12,505 |
+| `SO` | Shared-Other (ambiguous) | 1,108 |
+| `SD` | Shared-German | 807 |
+| `SE` | Shared-English | 699 |
+| `M` | Mixed morphology (ambiguous) | 246 |
+
+### Corpus Conversion (`corpus_converter.py`)
+
+Mapping these onto the project's `DE`/`EN`/`NEUT` labels and excluding the two ambiguous
+categories (`M`, `SO`) retains 73,656 of 75,010 non-empty tokens (98.19%), with 1,354 tokens
+(1.81%) excluded as having no reliable single-language assignment. The resulting label
+distribution is close to balanced between the two languages: `EN` 30,617, `DE` 30,537, `NEUT`
+12,502. 1,509 of 4,202 sentences (35.9%) contain both German and English tokens, confirming the
+corpus is a genuine code-switching resource rather than one dominated by monolingual segments.
+
+### Processed Dataset Integrity (Train/Val/Test)
+
+| Split | Sentences | Tokens | Unique comments | DE % | EN % | NEUT % |
+|---|---|---|---|---|---|---|
+| train | 3,347 | 59,196 | 769 | 41.07 | 41.77 | 17.16 |
+| val | 405 | 7,042 | 96 | 45.12 | 39.38 | 15.51 |
+| test | 449 | 7,418 | 97 | 41.09 | 42.05 | 16.86 |
+
+- **No comment-level leakage**: the 769/96/97 comment sets are pairwise disjoint, and combined
+  split tokens (73,656) reconcile exactly with the converter's retained-token count.
+- **Label balance holds across splits**: the random comment-level split did not introduce a
+  meaningful label-distribution skew between train/val/test.
+- **Token length is well covered** by `max_word_len=20`: mean token length is 4.6 characters, and
+  only 0.40% of training tokens are long enough to be truncated.
+- **Character vocabulary** (159 entries, including `<PAD>`/`<UNK>`) covers ASCII letters/digits/
+  punctuation, German-specific letters (`ä ö ü ß Ä Ö Ü`), and a long tail of other Unicode (emoji,
+  accented loanwords) present in the Reddit text. Out-of-vocabulary character rates on val/test are
+  negligible (0.040% / 0.012%), so `<UNK>` fallback is rarely exercised.
+- **Code-switching density** is consistent across splits (31.6–36.5% of sentences mix DE/EN),
+  averaging 2.3–2.7 switch points per code-switched sentence — short, localized switches rather
+  than pervasive mixing, matching Osmelak & Wintner's (2023) characterization of the corpus.
+
+### Training & Evaluation Results
+
+A full pipeline run (preprocessing → training → evaluation) was executed on CPU with the default
+architecture (4 residual blocks, 128 channels, kernel 3, dilations 1/2/4/8) for 2 of the
+configured 10 epochs, to validate correctness end-to-end rather than to reach a fully converged
+model. Results on the held-out test split (`checkpoints/best_tcn_eval_report.json`):
+
+| Metric | Value |
+|---|---|
+| Overall accuracy | 95.03% |
+| Macro-F1 | 0.9553 |
+| Weighted-F1 | 0.9502 |
+| DE F1 / EN F1 / NEUT F1 | 0.95 / 0.94 / 0.98 |
+| Inference throughput (CPU) | ~15,063 tokens/sec |
+| Peak resident memory (CPU) | ~631 MB |
+
+Confusion matrix (rows = true, columns = predicted; order `DE, EN, NEUT`):
+
+```text
+          pred DE  pred EN  pred NEUT
+true DE      2924      105         19
+true EN       203     2903         13
+true NEUT      11       18       1222
+```
+
+The dominant error mode is DE↔EN confusion (105 DE tokens predicted as EN, 203 EN tokens predicted
+as DE), while `NEUT` is classified almost perfectly, since punctuation and numbers are rarely
+ambiguous. This is consistent with prior work (Sterner & Teufel, 2023) identifying shared
+vocabulary and code-switch boundaries as the primary difficulty in German-English language
+identification, as opposed to clearly monolingual tokens.
+
+Note: these are preliminary results from a 2-epoch smoke run intended to validate pipeline
+correctness (data flow, loss masking, checkpointing, metric computation); they are not a tuned or
+fully converged result, and no baseline (BiLSTM-CRF/Transformer) or ablation (`--no_char_cnn`)
+comparison has been run yet.
 
 ---
 
 ## Research Questions Addressed
 
-- **RQ1**: TCN vs. BiLSTM-CRF vs. Transformer $F_1$-score comparison.
-- **RQ2**: Impact of character-level CNN extraction on complex word boundaries (e.g., German-English compounds).
-- **RQ3**: Throughput and memory footprint trade-offs on low-latency streaming pipelines.
+- **RQ1**: TCN vs. BiLSTM-CRF vs. Transformer $F_1$-score comparison. *(The 1D-TCN detector in this repository is fully implemented and evaluated; BiLSTM-CRF and Transformer baseline training scripts are the next planned addition for a direct comparison.)*
+- **RQ2**: Impact of character-level CNN extraction on complex word boundaries (e.g., German-English compounds). Use `--no_char_cnn` with `src/train.py` to train the ablated variant for comparison.
+- **RQ3**: Throughput and memory footprint trade-offs on low-latency streaming pipelines, reported by `src/evaluate.py`.
 
 ---
 

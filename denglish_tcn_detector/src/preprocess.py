@@ -89,6 +89,7 @@ def load_raw_data(file_path):
 def clean_row(row):
     tokens = row.get("tokens", [])
     labels = row.get("labels", [])
+    comment_id = row.get("comment_id", None)
 
     if len(tokens) != len(labels):
         logger.warning(
@@ -117,7 +118,54 @@ def clean_row(row):
     if invalid_label_count:
         logger.warning("Row had %d invalid label(s) replaced with '%s'.", invalid_label_count, FALLBACK_LABEL)
 
-    return {"tokens": cleaned_tokens, "labels": cleaned_labels}
+    record = {"tokens": cleaned_tokens, "labels": cleaned_labels}
+    if comment_id is not None and not (isinstance(comment_id, float) and pd.isna(comment_id)):
+        record["comment_id"] = comment_id
+    return record
+
+def split_dataframe(df, train_ratio, val_ratio, seed):
+    """Splits `df` into train/val/test.
+
+    When a "comment_id" column is present, the split is performed at the
+    comment (Reddit post) level rather than the sentence level: every
+    sentence originating from the same comment is kept in the same split.
+    This mirrors the project paper's data-leakage mitigation ("duplicate or
+    closely related Reddit comments ... will be kept within the same
+    split"). Without a "comment_id" column (e.g. ad-hoc datasets that are
+    already one independent sample per row), the previous row-level shuffle
+    is used instead.
+    """
+    if "comment_id" in df.columns:
+        unique_comments = df["comment_id"].drop_duplicates().sample(frac=1.0, random_state=seed)
+        total_comments = len(unique_comments)
+        train_end = int(total_comments * train_ratio)
+        val_end = train_end + int(total_comments * val_ratio)
+
+        train_ids = set(unique_comments.iloc[:train_end])
+        val_ids = set(unique_comments.iloc[train_end:val_end])
+        test_ids = set(unique_comments.iloc[val_end:])
+
+        shuffled_df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        train_df = shuffled_df[shuffled_df["comment_id"].isin(train_ids)].reset_index(drop=True)
+        val_df = shuffled_df[shuffled_df["comment_id"].isin(val_ids)].reset_index(drop=True)
+        test_df = shuffled_df[shuffled_df["comment_id"].isin(test_ids)].reset_index(drop=True)
+        logger.info(
+            "Split %d comments into Train/Val/Test (comment-level, no leakage): %d/%d/%d",
+            total_comments, len(train_ids), len(val_ids), len(test_ids),
+        )
+        return train_df, val_df, test_df
+
+    # Fall back to row-level shuffling when no grouping key is available.
+    shuffled_df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    total = len(shuffled_df)
+    train_end = int(total * train_ratio)
+    val_end = train_end + int(total * val_ratio)
+    return (
+        shuffled_df.iloc[:train_end],
+        shuffled_df.iloc[train_end:val_end],
+        shuffled_df.iloc[val_end:],
+    )
+
 
 def build_char_vocab(df):
     chars = set()
@@ -156,20 +204,22 @@ def main():
     if clean_df.empty:
         raise ValueError("No valid samples remained after cleaning; aborting.")
 
+    # Guard against partially-missing comment_id values (e.g. a raw dataset
+    # that only annotates some rows) so that rows never get silently dropped
+    # from every split in split_dataframe()'s isin() membership test.
+    if "comment_id" in clean_df.columns and clean_df["comment_id"].isna().any():
+        missing_mask = clean_df["comment_id"].isna()
+        clean_df.loc[missing_mask, "comment_id"] = [
+            f"__row_{i}__" for i in clean_df.index[missing_mask]
+        ]
+        logger.warning(
+            "Assigned synthetic comment_id to %d row(s) missing one.", missing_mask.sum()
+        )
+
     # Shuffle using pandas' own random_state for reproducibility.
-    clean_df = clean_df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
-
-    total = len(clean_df)
-    train_size = int(total * args.train_ratio)
-    val_size = int(total * args.val_ratio)
-    # Test gets the remainder so rounding never drops samples, even if the
-    # ratios don't divide `total` evenly.
-    train_end = train_size
-    val_end = train_size + val_size
-
-    train_df = clean_df.iloc[:train_end]
-    val_df = clean_df.iloc[train_end:val_end]
-    test_df = clean_df.iloc[val_end:]
+    train_df, val_df, test_df = split_dataframe(
+        clean_df, args.train_ratio, args.val_ratio, args.seed
+    )
 
     logger.info(
         "Split sizes — Train: %d, Val: %d, Test: %d", len(train_df), len(val_df), len(test_df)
